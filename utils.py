@@ -1,10 +1,26 @@
+import glob
+import os
 from functools import partial
-from ellipsoids import Ellipsoid, create_ellipse_from_mask, nms_ellipsoid, \
-    create_list_boxes_fromell
-from scipy.ndimage.measurements import label
+
 import numpy as np
-import torch
+from monai.data import list_data_collate, CacheDataset
+from monai.transforms import (
+    Compose,
+    LoadNiftid,
+    AddChanneld,
+    CropForegroundd,
+    RandCropByPosNegLabeld,
+    Orientationd,
+    ToTensord,
+    NormalizeIntensityd
+)
+from scipy.ndimage.measurements import label
 from torch import nn
+from torch.utils.data import DataLoader
+
+from ellipsoids import create_ellipse_from_mask, nms_ellipsoid, \
+    create_list_boxes_fromell
+
 
 def multi_apply(func, *args, **kwargs):
     '''
@@ -328,3 +344,87 @@ def ensuring_large_enough_boxes(list_box, min_size, shape):
                 b_new[3+d] = np.minimum(shape[d]-1,b[3+d]+half_diff)
         list_box_new.append(b_new)
     return list_box_new
+
+
+def get_dataloader(train_root, batch_size, patch_size, num_samples, val_root=None):
+    """ Function to get training and validation data loaders. """
+
+    train_images = sorted(glob.glob(os.path.join(train_root, 'OP', '*.nii.gz')))
+    train_labels = sorted(glob.glob(os.path.join(train_root, 'Labels', 'DistanceMap_*.nii.gz')))
+    train_bilabels = sorted(glob.glob(os.path.join(train_root, 'Labels_binary', 'Bi_DistanceMap_*.nii.gz')))
+
+    train_files = [
+        {
+            'image': image_name,
+            'label': label_name,
+            'bilabel': bilabel_name
+        } for image_name, label_name, bilabel_name in zip(train_images, train_labels, train_bilabels)
+    ]
+
+    train_files = train_files[:]
+
+    train_transforms = Compose([
+        LoadNiftid(keys=['image', 'label', 'bilabel']),
+        AddChanneld(keys=['image', 'label', 'bilabel']),
+        Orientationd(keys=['image', 'label', 'bilabel'], axcodes='RAS'),
+        NormalizeIntensityd(keys=['image']),
+        # RandGaussianNoised(keys=['image'], prob=0.75, mean=0.0, std=1.75),
+        # RandRotate90d(keys=['image', 'label', 'bilabel'], prob=0.5, spatial_axes=[0, 2]),
+        CropForegroundd(keys=['image', 'label', 'bilabel'], source_key='image'),
+        # RandCropByPosNegLabeld(
+        #     keys=['image', 'label', 'bilabel'], label_key='bilabel', size=[patch_sz, patch_sz, patch_sz], pos=1, neg=1, num_samples=n_samp
+        # ),
+        RandCropByPosNegLabeld(
+            keys=['image', 'label', 'bilabel'],
+            label_key='bilabel',
+            size=[patch_size, patch_size, patch_size],
+            pos=1, neg=1,
+            num_samples=num_samples, image_threshold=1
+        ),
+        # Spacingd(keys=['image', 'label', 'bilabel'], pixdim=(new_spacing, new_spacing, new_spacing), interp_order=(2, 0), mode='nearest'),
+        ToTensord(keys=['image', 'label', 'bilabel'])
+    ])
+
+    ## Define CacheDataset and DataLoader for training and validation
+    train_ds = CacheDataset(data=train_files, transform=train_transforms, cache_rate=1.0)
+
+    # Suggestion:
+    # According to https://discuss.pytorch.org/t/guidelines-for-assigning-num-workers-to-dataloader/813
+    # a num_worker = 4 * num_GPU is a good heuristic to follow
+    # Also, when working with GPUs, it is recommended to use pin_memory=True to store cache in the GPUs
+    # https://discuss.pytorch.org/t/when-to-set-pin-memory-to-true/19723
+    train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True, num_workers=4, pin_memory=True,
+                              collate_fn=list_data_collate)
+
+    if val_root:
+        val_images = sorted(glob.glob(os.path.join(val_root, 'OP', '*.nii.gz')))
+        val_labels = sorted(glob.glob(os.path.join(val_root, 'Labels', 'DistanceMap_*.nii.gz')))
+        val_bilabels = sorted(glob.glob(os.path.join(val_root, 'Labels_binary', 'Bi_DistanceMap_*.nii.gz')))
+        # val_bilabels = sorted(glob.glob(os.path.join(val_root, 'newLabels', 'SegmentedPerSlice_SABRE_*.nii.gz')))
+        val_files = [{'image': image_name, 'label': label_name, 'bilabel': bilabel_name} for
+                     image_name, label_name, bilabel_name in zip(val_images, val_labels, val_bilabels)]
+
+        val_files = val_files[:]
+
+        val_transforms = Compose([
+            LoadNiftid(keys=['image', 'label', 'bilabel']),
+            AddChanneld(keys=['image', 'label', 'bilabel']),
+            Orientationd(keys=['image', 'label', 'bilabel'], axcodes='RAS'),
+            NormalizeIntensityd(keys=['image']),
+            CropForegroundd(keys=['image', 'label', 'bilabel'], source_key='image'),
+            RandCropByPosNegLabeld(
+                keys=['image', 'label', 'bilabel'],
+                label_key='bilabel',
+                size=[patch_size, patch_size, patch_size],
+                pos=1, neg=1,
+                num_samples=num_samples, image_threshold=1
+            ),
+            ToTensord(keys=['image', 'label', 'bilabel'])
+        ])
+        val_ds = CacheDataset(data=val_files, transform=val_transforms, cache_rate=1.0)
+        val_loader = DataLoader(val_ds, batch_size=batch_size, shuffle=False, num_workers=4, pin_memory=True,
+                                collate_fn=list_data_collate)
+
+        return train_loader, val_loader
+
+    return train_loader
